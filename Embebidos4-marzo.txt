@@ -1,0 +1,324 @@
+/**
+ * @file SistemaMonitoreoFSM_Async.ino
+ * @author
+ * @date 2026
+ * @brief Sistema de monitoreo ambiental usando FSM y AsyncTaskLib en ESP32.
+ * 
+ * @details
+ * Este sistema implementa una Máquina de Estados Finitos (FSM)
+ * para el monitoreo de variables ambientales:
+ * 
+ * - Temperatura (DHT11)
+ * - Humedad (DHT11)
+ * - Nivel de luz (LDR)
+ * 
+ * El control de ejecución se realiza mediante la librería AsyncTaskLib,
+ * permitiendo multitarea cooperativa sin uso de FreeRTOS.
+ */
+
+#include "DHT.h"
+#include "StateMachineLib.h"
+#include "AsyncTaskLib.h"
+
+////////////////////////////////////////////////////////////
+/// ======== DEFINICIÓN DE PINES ========
+////////////////////////////////////////////////////////////
+
+#define DHTPIN 4       ///< Pin de datos del sensor DHT11
+#define DHTTYPE DHT11  ///< Tipo de sensor DHT
+#define LDR_PIN 34     ///< Pin analógico del LDR
+#define BUTTON_PIN 14  ///< Pin del botón de inicio/reset
+
+#define LED_GREEN 27   ///< LED indicador estado Inicio
+#define LED_BLUE  26   ///< LED indicador estado Alerta
+#define LED_RED   25   ///< LED indicador estado Alarma
+
+////////////////////////////////////////////////////////////
+/// ======== OBJETOS GLOBALES ========
+////////////////////////////////////////////////////////////
+
+DHT dht(DHTPIN, DHTTYPE);         ///< Objeto sensor DHT
+StateMachine machine(6, 20);      ///< Máquina de estados (6 estados, 20 transiciones)
+
+////////////////////////////////////////////////////////////
+/// ======== ENUMERACIONES ========
+////////////////////////////////////////////////////////////
+
+/**
+ * @enum State
+ * @brief Estados del sistema.
+ */
+enum State {
+  Inicio,   ///< Sistema detenido esperando activación
+  MonTemp,  ///< Monitoreo de temperatura
+  MonHum,   ///< Monitoreo de humedad
+  MonLuz,   ///< Monitoreo de luz
+  Alerta,   ///< Estado de advertencia
+  Alarma    ///< Estado crítico
+};
+
+/**
+ * @enum Input
+ * @brief Eventos que generan transiciones.
+ */
+enum Input {
+  Ninguno,
+  Boton,
+  TempAlta,
+  TempCritica,
+  HumBaja,
+  LuzBaja,
+  Timeout
+};
+
+volatile Input input = Ninguno; ///< Evento actual activo
+
+////////////////////////////////////////////////////////////
+/// ======== VARIABLES DEL SISTEMA ========
+////////////////////////////////////////////////////////////
+
+bool sistemaIniciado = false;  ///< Indica si el monitoreo está activo
+bool lastButton = HIGH;        ///< Último estado leído del botón
+
+float ultimaTemp = 0;          ///< Última temperatura registrada
+float ultimaHum  = 0;          ///< Última humedad registrada
+int   ultimaLuz  = 0;          ///< Último nivel de luz (%)
+
+unsigned long stateTime = 0;   ///< Tiempo de entrada al estado actual
+unsigned long blinkTime = 0;   ///< Temporizador para parpadeo
+unsigned long lastPrint = 0;   ///< Temporizador de impresión serial
+
+bool blinkState = false;       ///< Estado actual del LED (ON/OFF)
+int alertCount = 0;            ///< Número de alertas acumuladas
+
+////////////////////////////////////////////////////////////
+/// ======== FUNCIONES DE ESTADO ========
+////////////////////////////////////////////////////////////
+
+/**
+ * @brief Acción al entrar en estado Inicio.
+ */
+void onInicio() {
+  sistemaIniciado = false;
+  alertCount = 0;
+  stateTime = millis();
+}
+
+/**
+ * @brief Acción al entrar en monitoreo de temperatura.
+ */
+void onMonTemp() { sistemaIniciado = true; stateTime = millis(); }
+
+/**
+ * @brief Acción al entrar en monitoreo de humedad.
+ */
+void onMonHum() { stateTime = millis(); }
+
+/**
+ * @brief Acción al entrar en monitoreo de luz.
+ */
+void onMonLuz() { stateTime = millis(); }
+
+/**
+ * @brief Acción al entrar en estado Alerta.
+ */
+void onAlerta() { stateTime = millis(); }
+
+/**
+ * @brief Acción al entrar en estado Alarma.
+ */
+void onAlarma() { stateTime = millis(); }
+
+////////////////////////////////////////////////////////////
+/// ======== CONFIGURACIÓN DE FSM ========
+////////////////////////////////////////////////////////////
+
+/**
+ * @brief Configura transiciones y acciones de la máquina de estados.
+ */
+void setupMachine() {
+
+  machine.AddTransition(Inicio, MonTemp, [](){ return input == Boton; });
+
+  machine.AddTransition(MonTemp, Alerta, [](){ return input == TempAlta; });
+  machine.AddTransition(MonTemp, Alarma, [](){ return input == TempCritica; });
+  machine.AddTransition(MonTemp, MonHum, [](){ return input == Timeout; });
+
+  machine.AddTransition(MonHum, Alerta, [](){ return input == HumBaja; });
+  machine.AddTransition(MonHum, MonLuz, [](){ return input == Timeout; });
+
+  machine.AddTransition(MonLuz, Alerta, [](){ return input == LuzBaja; });
+  machine.AddTransition(MonLuz, MonTemp, [](){ return input == Timeout; });
+
+  machine.AddTransition(Alerta, Alarma, [](){
+    return alertCount >= 3 && ultimaTemp > 30;
+  });
+
+  machine.AddTransition(Alerta, MonTemp, [](){ return input == Timeout; });
+  machine.AddTransition(Alarma, Inicio, [](){ return input == Boton; });
+
+  machine.SetOnEntering(Inicio, onInicio);
+  machine.SetOnEntering(MonTemp, onMonTemp);
+  machine.SetOnEntering(MonHum, onMonHum);
+  machine.SetOnEntering(MonLuz, onMonLuz);
+  machine.SetOnEntering(Alerta, onAlerta);
+  machine.SetOnEntering(Alarma, onAlarma);
+}
+
+////////////////////////////////////////////////////////////
+/// ======== IMPRESIÓN SERIAL ========
+////////////////////////////////////////////////////////////
+
+/**
+ * @brief Imprime valores actuales del sistema en el monitor serial.
+ */
+void imprimirTabla() {
+  Serial.println("==========================================");
+  Serial.printf("Temp: %.1f °C\n", ultimaTemp);
+  Serial.printf("Hum : %.1f %%\n", ultimaHum);
+  Serial.printf("Luz : %d %%\n", ultimaLuz);
+  Serial.printf("Alertas acumuladas: %d\n", alertCount);
+  Serial.println("==========================================");
+}
+
+////////////////////////////////////////////////////////////
+/// ======== TAREAS ASÍNCRONAS ========
+////////////////////////////////////////////////////////////
+
+/**
+ * @brief Tarea que actualiza la FSM y detecta botón.
+ */
+AsyncTask taskFSM(50, true, []() {
+
+  bool actual = digitalRead(BUTTON_PIN);
+
+  if (lastButton == HIGH && actual == LOW) {
+    input = Boton;
+  }
+
+  lastButton = actual;
+
+  machine.Update();
+  input = Ninguno;
+});
+
+/**
+ * @brief Tarea que lee sensores y genera eventos.
+ */
+AsyncTask taskSensores(200, true, []() {
+
+  if (!sistemaIniciado) return;
+
+  State actual = (State)machine.GetState();
+
+  if (millis() - lastPrint >= 1000) {
+
+    lastPrint = millis();
+
+    if (actual == MonTemp) {
+      float t = dht.readTemperature();
+      if (!isnan(t)) {
+        ultimaTemp = t;
+        if (t > 30) input = TempCritica;
+        else if (t > 25) {
+          alertCount++;
+          input = TempAlta;
+        }
+      }
+    }
+
+    if (actual == MonHum) {
+      float h = dht.readHumidity();
+      if (!isnan(h)) {
+        ultimaHum = h;
+        if (h < 60) {
+          alertCount++;
+          input = HumBaja;
+        }
+      }
+    }
+
+    if (actual == MonLuz) {
+      int valor = analogRead(LDR_PIN);
+      ultimaLuz = map(valor, 0, 4095, 0, 100);
+
+      if (ultimaLuz < 60) {
+        alertCount++;
+        input = LuzBaja;
+      }
+    }
+
+    imprimirTabla();
+  }
+
+  unsigned long tiempo = millis() - stateTime;
+
+  if ((actual == MonTemp && tiempo >= 3000) ||
+      (actual == MonHum  && tiempo >= 4000) ||
+      (actual == MonLuz  && tiempo >= 2000) ||
+      (actual == Alerta  && tiempo >= 2000)) {
+    input = Timeout;
+  }
+});
+
+/**
+ * @brief Tarea que controla el parpadeo de LEDs según estado.
+ */
+AsyncTask taskLEDs(50, true, []() {
+
+  State actual = (State)machine.GetState();
+  unsigned long intervalo = 0;
+
+  if (actual == Inicio) intervalo = 200;
+  if (actual == Alerta) intervalo = blinkState ? 500 : 900;
+  if (actual == Alarma) intervalo = blinkState ? 100 : 300;
+
+  if (intervalo > 0 && millis() - blinkTime >= intervalo) {
+    blinkTime = millis();
+    blinkState = !blinkState;
+
+    digitalWrite(LED_GREEN, actual == Inicio ? blinkState : LOW);
+    digitalWrite(LED_BLUE,  actual == Alerta ? blinkState : LOW);
+    digitalWrite(LED_RED,   actual == Alarma ? blinkState : LOW);
+  }
+});
+
+////////////////////////////////////////////////////////////
+/// ======== SETUP ========
+////////////////////////////////////////////////////////////
+
+/**
+ * @brief Inicializa periféricos y arranca el sistema.
+ */
+void setup() {
+
+  Serial.begin(115200);
+  analogSetAttenuation(ADC_11db);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LDR_PIN, INPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+
+  dht.begin();
+  setupMachine();
+  machine.SetState(Inicio, false, true);
+
+  taskFSM.Start();
+  taskSensores.Start();
+  taskLEDs.Start();
+}
+
+////////////////////////////////////////////////////////////
+/// ======== LOOP PRINCIPAL ========
+////////////////////////////////////////////////////////////
+
+/**
+ * @brief Ejecuta las tareas asíncronas.
+ */
+void loop() {
+  taskFSM.Update();
+  taskSensores.Update();
+  taskLEDs.Update();
+}
